@@ -30,9 +30,10 @@ async function coverage(page) {
     const THREE = await import('three'), d = window.__dbg;
     const e = d.sourcePanels.entries.find(e => e.n === d.sourcePanels.focused);
     const ray = new THREE.Raycaster(), hits = [];
-    const meshes = e.root.children.filter(m => m !== e.background && m.visible);
+    const meshes = e.root.children.filter(m => m !== e.background && m !== e.backing && m.visible);
     for (const x of [-.75, -.25, .25, .75]) for (const y of [-.75, -.25, .25, .75]) {
       ray.setFromCamera(new THREE.Vector2(x, y), d.camera);
+      if (!ray.intersectObject(e.background, false).length) continue;
       const hit = ray.intersectObjects(meshes, false).sort((a, b) => b.object.renderOrder - a.object.renderOrder)[0];
       if (!hit) { hits.push(0); continue; }
       ray.setFromCamera(new THREE.Vector2(x + 2 / innerWidth, y), d.camera);
@@ -52,7 +53,7 @@ try {
     await page.goto(`${session.base}/index.html?focus=${focus}&z=110`);
     const state = await stable(page); // Also runs against the old app for negative proof.
     const density = await coverage(page);
-    assert.ok(density.length >= 12 && Math.min(...density) >= .98, `DPR ${dpr}: every sampled pixel needs native-resolution detail; ${density}`);
+    assert.ok(density.length >= 4 && Math.min(...density) >= .98, `DPR ${dpr}: every sampled source pixel needs native-resolution detail; ${density}`);
     const posture = await page.evaluate(() => {
       const d = window.__dbg;
       return { above: d.camera.position.y > d.gaze.y, focused: d.sourcePanels.focused.path,
@@ -85,7 +86,7 @@ try {
       for (let i = 0; i < 5; i++) await page.mouse.wheel(0, -1000);
       await stable(page);
       const before = await page.evaluate(() => ({ ...window.__dbg.rig }));
-      assert.equal(before.goalDist, 30);
+      assert.equal(before.goalDist, before.min);
       await page.mouse.wheel(0, -1000); await page.waitForTimeout(100);
       const after = await page.evaluate(() => ({ ...window.__dbg.rig }));
       assert.equal(after.goalTx, before.goalTx); assert.equal(after.goalTz, before.goalTz);
@@ -100,7 +101,7 @@ try {
       await page.setViewportSize({ width: 2560, height: 1440 });
       await stable(page);
       const large = await coverage(page);
-      assert.ok(large.length >= 12 && Math.min(...large) >= .98, 'large-display detail covers the viewport');
+      assert.ok(large.length >= 4 && Math.min(...large) >= .98, 'large-display detail covers the visible source');
       await page.screenshot({ path: join(root, 'tools/shots/large-display.png') });
       console.log('Close zoom, zoom limits, pan, occlusion and 2560×1440 DPR 2 passed');
     }

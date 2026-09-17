@@ -4,6 +4,7 @@
 // Zoom LOD: file tops get visible source tiles at the projected pixel density.
 import * as THREE from 'three';
 import { SourcePanels } from './source-panels.js';
+import { SOURCE_FONT, SOURCE_LINE, SOURCE_PAD } from './source-layout.js';
 
 const WORLD = 1000;
 const LANG_COLOR = {
@@ -30,46 +31,63 @@ const camera = new THREE.PerspectiveCamera(42, 1, 1, 8000);
 const rig = {
   tx: WORLD / 2, tz: WORLD / 2, dist: 1500,
   goalTx: WORLD / 2, goalTz: WORLD / 2, goalDist: 1500,
+  panY: 0, goalPanY: 0,
   min: 30, max: 2400,
 };
 function tiltAt(dist) {
   const k = Math.max(0, Math.min(1, (1000 - dist) / 970)); // 0 far → 1 at closest
   return 0.72 + 0.38 * k * k * (3 - 2 * k); // smoothstep: 41° → ~63° from vertical
 }
-let focusedFile = null;
+let focusedFile = null, focusedLine = null;
+let gazeLift = 0, gazeShift = 0, firstCamera = true, cameraMoving = false;
+const PICK_DISTANCE = 850, RELEASE_DISTANCE = 1050;
 const gaze = new THREE.Vector3();
 function applyCamera(dt) {
   const alpha = 1 - Math.exp(-dt / 90);
   rig.tx += (rig.goalTx - rig.tx) * alpha;
   rig.tz += (rig.goalTz - rig.tz) * alpha;
   rig.dist += (rig.goalDist - rig.dist) * alpha;
+  rig.panY += (rig.goalPanY - rig.panY) * alpha;
   const t = tiltAt(rig.dist);
   const y = Math.cos(t) * rig.dist;
   const back = Math.sin(t) * rig.dist;
   const gate = Math.max(0, Math.min(1, (900 - rig.dist) / 700));
   const lean = panelLean();
-  const halfHeight = focusedFile ? Math.max(.01, focusedFile.rect[3] * WORLD - 1) / 2 : 0;
-  const targetY = focusedFile ? BASE + boxHeight.get(focusedFile) + .15 + halfHeight * Math.sin(lean) : 130;
-  gaze.set(rig.tx, targetY * gate, rig.tz + halfHeight * (1 - Math.cos(lean)) * gate);
+  const e = sourcePanels.active;
+  const v = e ? (focusedLine === null ? e.docHeight / 2 : Math.min(e.docHeight, SOURCE_PAD + (focusedLine + .5) * SOURCE_LINE)) : 0;
+  const height = e ? (e.docHeight - v) * e.height / e.docHeight : 0;
+  const targetY = e ? BASE + boxHeight.get(e.n) + .15 + height * Math.sin(lean) : 0;
+  const targetShift = height * (1 - Math.cos(lean)) * gate;
+  // Smooth the raised target too: changing files must not teleport the camera.
+  gazeLift += (targetY * gate - gazeLift) * (firstCamera ? 1 : alpha);
+  gazeShift += (targetShift - gazeShift) * (firstCamera ? 1 : alpha);
+  firstCamera = false;
+  cameraMoving = Math.abs(targetY * gate - gazeLift) + Math.abs(targetShift - gazeShift) + Math.abs(rig.goalPanY - rig.panY) > .001;
+  gaze.set(rig.tx, gazeLift + rig.panY, rig.tz + gazeShift);
   // Distance and tilt are relative to the raised target, so close zoom never
   // crosses below it or reverses the viewing direction.
   camera.position.set(gaze.x, gaze.y + y, gaze.z + back);
   camera.lookAt(gaze);
   camera.updateMatrixWorld();
-  groundPlane.constant = -gaze.y;
+  // Pan in the selected document's plane, including height. A horizontal-only
+  // pan cannot reach the top/bottom of a tall raised file at reading distance.
+  navigationNormal.set(0, e ? Math.cos(lean) : 1, e ? Math.sin(lean) : 0);
+  groundPlane.setFromNormalAndCoplanarPoint(navigationNormal, gaze);
 }
 function flyTo(tx, tz, dist) {
   rig.goalTx = tx; rig.goalTz = tz;
   rig.goalDist = Math.max(rig.min, Math.min(rig.max, dist));
   invalidate();
 }
-function zoomAt(px, pz, factor) {
+function zoomAt(px, py, pz, factor) {
   const next = Math.max(rig.min, Math.min(rig.max, rig.goalDist * factor));
+  if (next === rig.goalDist) return;
   factor = next / rig.goalDist;
   // Apply the clamped factor to pan as well as zoom; wheel input at a limit
   // must not keep moving the map.
   rig.goalTx = px + (rig.goalTx - px) * factor;
-  rig.goalTz = pz + (rig.goalTz - pz) * factor;
+  rig.goalTz = pz + (rig.goalTz + gazeShift - pz) * factor - gazeShift;
+  rig.goalPanY = py + (gazeLift + rig.goalPanY - py) * factor - gazeLift;
   rig.goalDist = next;
   invalidate();
 }
@@ -77,6 +95,7 @@ function zoomAt(px, pz, factor) {
 // --- pan / zoom controls ----------------------------------------------------
 let dragging = false, moved = 0, lx = 0, ly = 0;
 const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+const navigationNormal = new THREE.Vector3();
 const ray = new THREE.Raycaster();
 const ndc = new THREE.Vector2();
 function screenToGround(cx, cy, out) {
@@ -94,24 +113,29 @@ canvas.addEventListener('pointermove', e => {
   if (screenToGround(e.clientX, e.clientY, hitA) && screenToGround(e.clientX - dx, e.clientY - dy, hitB)) {
     rig.goalTx -= hitA.x - hitB.x;
     rig.goalTz -= hitA.z - hitB.z;
+    rig.goalPanY -= hitA.y - hitB.y;
     rig.tx -= hitA.x - hitB.x;
     rig.tz -= hitA.z - hitB.z;
+    rig.panY -= hitA.y - hitB.y;
     invalidate();
   }
 });
+function fileAt(cx, cy) {
+  ndc.set(cx / innerWidth * 2 - 1, 1 - cy / innerHeight * 2);
+  ray.setFromCamera(ndc, camera);
+  const e = sourcePanels.active;
+  if (e?.root.visible) {
+    const hits = ray.intersectObjects([e.background, e.backing].filter(m => m.visible), false);
+    if (hits.length) return e.n; // the selected solid and source render in front
+  }
+  const hits = ray.intersectObject(fileMesh, false);
+  return hits.length ? fileNodes[hits[0].instanceId] : null;
+}
 canvas.addEventListener('pointerup', e => {
   dragging = false;
-  if (moved < 5) { // click: focus building under cursor
-    ndc.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
-    ray.setFromCamera(ndc, camera);
-    const panels = sourcePanels.entries.filter(e => e.root.visible);
-    const selected = panels.find(e => e.n === focusedFile);
-    const foreground = selected && ray.intersectObject(selected.background, false);
-    const panelHits = foreground?.length ? foreground : ray.intersectObjects(panels.map(e => e.background), false);
-    const hits = ray.intersectObject(fileMesh, false);
-    if (panelHits.length && (foreground?.length || !hits.length || panelHits[0].distance < hits[0].distance))
-      focusFile(panelHits[0].object.userData.node);
-    else if (hits.length) focusFile(fileNodes[hits[0].instanceId]);
+  if (moved < 5) {
+    const n = fileAt(e.clientX, e.clientY);
+    if (n) focusFile(n);
   }
 });
 canvas.addEventListener('pointercancel', () => { dragging = false; });
@@ -120,7 +144,18 @@ canvas.addEventListener('wheel', e => {
   e.preventDefault();
   const delta = e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? innerHeight : 1);
   const f = Math.exp(Math.max(-1, Math.min(1, delta * .0011)));
-  if (screenToGround(e.clientX, e.clientY, hitA)) zoomAt(hitA.x, hitA.z, f);
+  const next = Math.max(rig.min, Math.min(rig.max, rig.goalDist * f));
+  if (f < 1 && !focusedFile && next < PICK_DISTANCE) {
+    const n = fileAt(e.clientX, e.clientY) || fileAt(innerWidth / 2, innerHeight / 2);
+    if (n) {
+      selectFile(n);
+      const [x, z, w, h] = n.rect;
+      flyTo((x + w / 2) * WORLD, (z + h / 2) * WORLD, next);
+      return;
+    }
+  }
+  if (screenToGround(e.clientX, e.clientY, hitA)) zoomAt(hitA.x, hitA.y, hitA.z, f);
+  else zoomAt(rig.goalTx, gaze.y, rig.goalTz + gazeShift, f);
 }, { passive: false });
 
 // --- data -------------------------------------------------------------------
@@ -144,20 +179,32 @@ const boxHeight = new Map(fileNodes.map(n => [n, heightOf(n)]));
 // --- buildings: one InstancedMesh -------------------------------------------
 const boxGeo = new THREE.BoxGeometry(1, 1, 1);
 const boxMat = new THREE.MeshLambertMaterial();
+const buildingMatrices = [], nodeIndex = new Map(fileNodes.map((n, i) => [n, i]));
+const hiddenBuilding = new THREE.Matrix4().makeScale(0, 0, 0);
 const fileMesh = new THREE.InstancedMesh(boxGeo, boxMat, fileNodes.length);
 {
   const m = new THREE.Matrix4(), col = new THREE.Color();
   fileNodes.forEach((n, i) => {
     const [x, y, w, h] = n.rect;
     const bh = boxHeight.get(n);
-    m.makeScale(w * WORLD - 0.6, bh, h * WORLD - 0.6);
+    m.makeScale(w * WORLD, bh, h * WORLD);
     m.setPosition((x + w / 2) * WORLD, BASE + bh / 2, (y + h / 2) * WORLD);
     fileMesh.setMatrixAt(i, m);
+    buildingMatrices.push(m.clone());
     fileMesh.setColorAt(i, col.setHex(LANG_COLOR[n.lang] ?? LANG_COLOR.other).multiplyScalar(0.85));
   });
 }
 fileMesh.instanceMatrix.needsUpdate = true;
+// Keep conservative bounds for the complete city while individual instances
+// are hidden/replaced by a raised solid and subsequently restored.
+fileMesh.computeBoundingBox();
+fileMesh.computeBoundingSphere();
 scene.add(fileMesh);
+function showBuilding(n, visible) {
+  const i = nodeIndex.get(n);
+  fileMesh.setMatrixAt(i, visible ? buildingMatrices[i] : hiddenBuilding);
+  fileMesh.instanceMatrix.needsUpdate = true;
+}
 
 // --- dir slabs + outlines ------------------------------------------------------
 {
@@ -194,7 +241,9 @@ scene.add(sun);
 
 // --- source panels -----------------------------------------------------------
 const sourcePanels = new SourcePanels({ scene, camera, renderer, nodes: fileNodes,
-  heightOf: n => boxHeight.get(n), world: WORLD, base: BASE, onChange: invalidate });
+  heightOf: n => boxHeight.get(n), world: WORLD, base: BASE, onChange: invalidate,
+  showBuilding, sourceBase: data.sourceBase, colorOf: n => LANG_COLOR[n.lang] ?? LANG_COLOR.other });
+for (const light of scene.children.filter(c => c.isLight)) sourcePanels.overlay.add(light.clone());
 function panelLean() {
   const gate = Math.max(0, Math.min(1, (900 - rig.dist) / 700));
   return tiltAt(rig.dist) * gate;
@@ -214,8 +263,9 @@ function worldPerPixel() {
 // --- labels (HTML overlay) ----------------------------------------------------
 const labelPool = [];
 const labelsEl = document.getElementById('labels');
+let labelCursor = 0;
 function labelFor() {
-  let el = labelPool.find(l => !l.used);
+  let el = labelPool[labelCursor++];
   if (!el) {
     const div = document.createElement('div');
     div.className = 'lbl';
@@ -229,8 +279,8 @@ function labelFor() {
 }
 const projV = new THREE.Vector3();
 function updateLabels() {
-  for (const l of labelPool) { l.used = false; l.div.style.display = 'none'; }
-  if (sourcePanels.reading) return;
+  labelCursor = 0;
+  if (sourcePanels.reading) { for (const l of labelPool) l.div.style.display = 'none'; return; }
   const wpp = worldPerPixel();
   const labelDirs = wpp < 2.2;
   const labelFiles = wpp < 0.09;
@@ -249,28 +299,39 @@ function updateLabels() {
     const el = labelFor();
     el.div.textContent = isDir ? n.name : n.name;
     el.div.className = 'lbl' + (isDir ? ' dir' : '');
-    el.div.style.left = sx + 'px';
-    el.div.style.top = sy + 'px';
+    el.div.style.transform = `translate3d(${sx.toFixed(1)}px, ${sy.toFixed(1)}px, 0) translate(-50%, -100%)`;
   };
   if (labelDirs) for (const n of dirNodes) tryPlace(n, true);
   if (labelFiles) for (const n of fileNodes) tryPlace(n, false);
+  for (let i = labelCursor; i < labelPool.length; i++) labelPool[i].div.style.display = 'none';
 }
 
-// --- highlight ----------------------------------------------------------------
-const hl = new THREE.LineSegments(
-  new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)),
-  new THREE.LineBasicMaterial({ color: 0xf74c00 }));
-hl.visible = false;
-scene.add(hl);
-function focusFile(n) {
-  focusedFile = n;
+// --- selection ---------------------------------------------------------------
+const selectionEl = document.getElementById('selection');
+function readingDistance(n) {
+  const scale = n.rect[2] * WORLD / n.source.width;
+  return scale * SOURCE_FONT * innerHeight / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * 16);
+}
+function selectFile(n, line = null) {
+  focusedFile = n; focusedLine = line;
+  rig.goalPanY = 0;
   sourcePanels.focus(n);
-  const [x, y, w, h] = n.rect;
-  flyTo((x + w / 2) * WORLD, (y + h / 2) * WORLD, Math.max(110, Math.max(w, h) * WORLD * 1.9));
-  const bh = boxHeight.get(n);
-  hl.scale.set(w * WORLD + 2, bh + 4, h * WORLD + 2);
-  hl.position.set((x + w / 2) * WORLD, BASE + (bh + 2) / 2, (y + h / 2) * WORLD);
-  hl.visible = true;
+  rig.min = n ? Math.min(30, readingDistance(n) / 4) : 30;
+  camera.near = Math.min(1, rig.min / 20);
+  camera.updateProjectionMatrix();
+  selectionEl.hidden = !n;
+  selectionEl.textContent = n ? `${n.path} · ${n.lines.toLocaleString()} lines · Esc to return` : '';
+  selectionEl.style.borderColor = n ? '#' + (LANG_COLOR[n.lang] ?? LANG_COLOR.other).toString(16).padStart(6, '0') : '';
+  invalidate();
+}
+function focusFile(n, line = null) {
+  selectFile(n, line);
+  const [x, z, w, h] = n.rect;
+  const v = line === null ? n.source.height / 2 : Math.min(n.source.height, SOURCE_PAD + (line + .5) * SOURCE_LINE);
+  const targetZ = (z + h * v / n.source.height) * WORLD;
+  const distance = line === null ? Math.max(readingDistance(n), Math.max(h, w / camera.aspect) * WORLD * 1.5) : readingDistance(n);
+  const u = line === null ? n.source.width / 2 : Math.min(n.source.width / 2, 240);
+  flyTo((x + w * u / n.source.width) * WORLD, targetZ, Math.min(800, distance));
 }
 
 // --- search ----------------------------------------------------------------------
@@ -313,7 +374,7 @@ function pick(i) {
   resEl.classList.remove('open');
   qEl.blur();
   const node = fileNodes.find(n => n.path === r.path);
-  if (node) focusFile(node);
+  if (node) focusFile(node, r.kind === node.lang ? null : r.line);
 }
 qEl.addEventListener('input', runSearch);
 qEl.addEventListener('keydown', e => {
@@ -324,6 +385,7 @@ qEl.addEventListener('keydown', e => {
 });
 addEventListener('keydown', e => {
   if (e.key === '/' && document.activeElement !== qEl) { e.preventDefault(); qEl.focus(); }
+  if (e.key === 'Escape' && document.activeElement !== qEl) flyTo(WORLD / 2, WORLD / 2, 1500);
 });
 
 // --- deep-link params for headless screenshots --------------------------------
@@ -355,10 +417,13 @@ let lastTime = performance.now(), draws = 0;
 function loop(now) {
   const dt = Math.min(50, Math.max(1, now - lastTime)); lastTime = now;
   const moving = Math.abs(rig.goalTx - rig.tx) + Math.abs(rig.goalTz - rig.tz) + Math.abs(rig.goalDist - rig.dist) > .001;
-  if (dirty || moving || sourcePanels.pending) {
+  if (dirty || moving || cameraMoving || sourcePanels.pending) {
     dirty = false;
     applyCamera(dt);
-    sourcePanels.update(panelLean());
+    if (focusedFile && rig.dist >= RELEASE_DISTANCE && rig.goalDist >= RELEASE_DISTANCE) selectFile(null);
+    sourcePanels.update(panelLean(), { moving: moving || dragging || cameraMoving, detail: rig.dist < 900 });
+    const emphasis = focusedFile ? Math.max(0, Math.min(1, (900 - rig.dist) / 400)) : 0;
+    boxMat.color.setScalar(1 - .68 * emphasis);
     updateLabels();
     renderer.clear();
     if (!sourcePanels.coveringViewport) renderer.render(scene, camera);
@@ -371,4 +436,5 @@ requestAnimationFrame(loop);
 window.__ready = true;
 window.__scene = scene; window.__data = data;
 window.__dbg = { scene, camera, renderer, fileNodes, sourcePanels, rig, gaze, focusFile,
+  get cameraMoving() { return cameraMoving; }, get needsFrame() { return dirty; }, fileAt, fileMesh,
   get boxHeight() { return boxHeight; }, get draws() { return draws; } };

@@ -1,8 +1,9 @@
 import * as THREE from 'three';
+import { SOURCE_FONT, SOURCE_LINE as LINE, SOURCE_PAD as PAD, sourceLines } from './source-layout.js';
 
-// A rooftop is a 560-unit-wide document. Rasterize only its visible tiles,
+// Each rooftop has the dimensions of its complete source. Rasterize visible tiles,
 // directly from text at each resolution (never magnify a lower-resolution tile).
-const WIDTH = 560, LINE = 17, TILE = 512, GUTTER = 2;
+const TILE = 512, GUTTER = 2;
 const SIDE = TILE + GUTTER * 2;
 const TILE_BYTES = Math.ceil(SIDE * SIDE * 4 * 4 / 3); // RGBA + mip chain
 const MAX_BYTES = 128 * 1024 * 1024;
@@ -40,8 +41,8 @@ function clipPolygon(vertices) {
 }
 
 export class SourcePanels {
-  constructor({ scene, camera, renderer, nodes, heightOf, world, base, onChange }) {
-    Object.assign(this, { camera, renderer, onChange });
+  constructor({ scene, camera, renderer, nodes, heightOf, world, base, onChange, colorOf = () => 0xf74c00, showBuilding = () => {}, sourceBase = 'demo-src' }) {
+    Object.assign(this, { camera, renderer, onChange, colorOf, showBuilding, sourceBase });
     this.group = new THREE.Group();
     scene.add(this.group);
     this.overlay = new THREE.Scene();
@@ -52,28 +53,51 @@ export class SourcePanels {
     this.clock = 0;
     this.paints = 0;
     this.focused = null;
+    this.active = null;
+    this.measurements = 0;
     this.pending = false;
     this.matrix = new THREE.Matrix4();
     this.viewProjection = new THREE.Matrix4();
     this.entries = nodes.map(n => {
       const [x, z, w, h] = n.rect;
-      const width = Math.max(.01, w * world - 1), height = Math.max(.01, h * world - 1);
+      const width = w * world, height = h * world;
       const root = new THREE.Group();
-      root.position.set((x + w / 2) * world, base + heightOf(n) + .15, (z + h) * world - 1);
-      const geometry = new THREE.PlaneGeometry(width, height);
-      geometry.translate(0, height / 2, 0);
-      const background = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ color: 0x11141d }));
-      background.userData.node = n;
-      root.add(background);
+      root.position.set((x + w / 2) * world, base + heightOf(n) + .15, (z + h) * world);
       root.visible = false;
-      this.group.add(root);
-      return { n, root, background, width, height, docHeight: WIDTH * height / width, level: 0 };
+      // Inactive files have no panel meshes in the scene graph. The overview
+      // stays one instanced city, without hidden per-file matrix traversal.
+      return { n, root, width, height, depth: heightOf(n),
+        docWidth: n.source.width, docHeight: n.source.height, level: 0 };
     });
+    this.byNode = new Map(this.entries.map(e => [e.n, e]));
   }
 
   focus(n) {
+    if (this.focused === n) return;
+    if (this.active) {
+      this.active.root.visible = false;
+      this.overlay.remove(this.active.root);
+      this.showBuilding(this.active.n, true);
+    }
     this.focused = n;
-    for (const e of this.entries) (e.n === n ? this.overlay : this.group).add(e.root);
+    this.active = this.byNode.get(n) || null;
+    const e = this.active;
+    if (e) {
+      if (!e.background) {
+        const geometry = new THREE.PlaneGeometry(e.width, e.height);
+        geometry.translate(0, e.height / 2, 0);
+        e.background = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ color: 0x11141d }));
+        e.background.userData.node = n;
+        const rim = 8 * e.width / e.docWidth;
+        e.backing = new THREE.Mesh(new THREE.BoxGeometry(e.width + 2 * rim, e.height + 2 * rim, e.depth),
+          new THREE.MeshLambertMaterial({ color: this.colorOf(n) }));
+        e.backing.position.set(0, e.height / 2, -e.depth / 2 - .05);
+        e.backing.userData.node = n;
+        e.root.add(e.backing, e.background);
+      }
+      this.overlay.add(e.root);
+      this.showBuilding(n, false);
+    }
     this.onChange();
   }
 
@@ -90,26 +114,27 @@ export class SourcePanels {
     while (this.inFlight < 4 && this.requests.length) {
       const path = this.requests.shift();
       this.inFlight++;
-      fetch(`demo-src/${path.split('/').map(encodeURIComponent).join('/')}`)
+      fetch(`${this.sourceBase}/${path.split('/').map(encodeURIComponent).join('/')}`)
         .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.text(); })
-        .then(text => this.sources.set(path, { status: 'ready', lines: text.split('\n') }))
+        .then(text => this.sources.set(path, { status: 'ready', lines: sourceLines(text) }))
         .catch(() => this.sources.set(path, { status: 'error', lines: ['// Source unavailable. Reload to retry.'] }))
         .finally(() => { this.inFlight--; this.pump(); this.onChange(); });
     }
   }
 
   project(e, u, v) {
-    const p = new THREE.Vector4((u / WIDTH - .5) * e.width, (e.docHeight - v) * e.width / WIDTH, 0, 1)
+    const p = new THREE.Vector4((u / e.docWidth - .5) * e.width, (e.docHeight - v) * e.height / e.docHeight, 0, 1)
       .applyMatrix4(this.matrix);
     return { x: p.x, y: p.y, z: p.z, w: p.w, u, v };
   }
 
   measure(e, viewport) {
+    this.measurements++;
     this.matrix.multiplyMatrices(this.viewProjection, e.root.matrixWorld);
-    const polygon = clipPolygon([this.project(e, 0, 0), this.project(e, WIDTH, 0),
-      this.project(e, WIDTH, e.docHeight), this.project(e, 0, e.docHeight)]);
+    const polygon = clipPolygon([this.project(e, 0, 0), this.project(e, e.docWidth, 0),
+      this.project(e, e.docWidth, e.docHeight), this.project(e, 0, e.docHeight)]);
     if (!polygon.length) return null;
-    let density = 0, u0 = WIDTH, v0 = e.docHeight, u1 = 0, v1 = 0;
+    let density = 0, u0 = e.docWidth, v0 = e.docHeight, u1 = 0, v1 = 0;
     let sx0 = Infinity, sx1 = -Infinity, sy0 = Infinity, sy1 = -Infinity;
     for (const p of polygon) {
       u0 = Math.min(u0, p.u); u1 = Math.max(u1, p.u);
@@ -136,32 +161,37 @@ export class SourcePanels {
       area: Math.abs(area) / 2 };
   }
 
-  update(lean) {
+  update(lean, { moving = false, detail = true } = {}) {
     this.clock++;
+    this.coveringViewport = false;
+    this.reading = false;
+    this.pending = false;
+    const e = this.active;
+    // No projection, source fetch, canvas paint or tile scheduling at map scale.
+    if (!e) return 0;
+    e.root.rotation.x = -Math.PI / 2 + lean;
+    e.root.visible = true;
+    e.root.updateMatrixWorld(true);
+    if (!detail) {
+      e.background.visible = false;
+      for (const tile of this.cache.values()) if (tile.e === e && !tile.preview) tile.mesh.visible = false;
+      return 0;
+    }
     this.viewProjection.multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse);
     const viewport = this.renderer.getDrawingBufferSize(new THREE.Vector2());
-    const candidates = [];
-    for (const e of this.entries) {
-      e.root.rotation.x = -Math.PI / 2 + lean;
-      e.root.updateMatrixWorld(true);
-      const m = this.measure(e, viewport);
-      e.root.visible = !!m && m.pixels / this.renderer.getPixelRatio() >= 180;
-      if (!e.root.visible) continue;
-      // Hysteresis: refine before magnification; retain extra detail until
-      // zoomed out by a full level, avoiding repaint at a boundary.
-      const scale = scaleAt(e.level);
-      if (m.density * 1.15 > scale || m.density * 3 < scale)
-        e.level = Math.max(0, Math.ceil(2 * Math.log2(Math.max(1, m.density * 1.15))));
-      e.measure = m;
-      candidates.push(e);
+    const m = this.measure(e, viewport);
+    e.background.visible = !!m && m.pixels / this.renderer.getPixelRatio() >= 100;
+    if (!e.background.visible) {
+      for (const tile of this.cache.values()) if (tile.e === e && !tile.preview) tile.mesh.visible = false;
+      return 0;
     }
-    candidates.sort((a, b) => Number(b.n === this.focused) - Number(a.n === this.focused) || b.measure.area - a.measure.area);
-    this.coveringViewport = candidates[0]?.n === this.focused && candidates[0].measure.area > 3.9999;
-    if (this.coveringViewport) {
-      for (const e of candidates.slice(1)) e.root.visible = false;
-      candidates.length = 1;
-    }
-    this.reading = candidates.some(e => e.n === this.focused && e.measure.pixels / this.renderer.getPixelRatio() > 300);
+    const scale = scaleAt(e.level);
+    if (m.density * 1.15 > scale || m.density * 3 < scale)
+      e.level = Math.max(0, Math.ceil(2 * Math.log2(Math.max(1, m.density * 1.15))));
+    e.measure = m;
+    this.coveringViewport = m.area > 3.9999;
+    this.reading = true;
+    const candidates = [e];
     const wanted = [];
     for (const e of candidates) {
       this.load(e.n.path, e.n === this.focused);
@@ -175,7 +205,7 @@ export class SourcePanels {
       // can approach infinity: bound enumeration before creating any jobs.
       do {
         span = TILE / scaleAt(e.level);
-        x0 = Math.max(0, Math.floor(m.u0 / span)); x1 = Math.ceil(Math.min(WIDTH, m.u1) / span);
+        x0 = Math.max(0, Math.floor(m.u0 / span)); x1 = Math.ceil(Math.min(e.docWidth, m.u1) / span);
         y0 = Math.max(0, Math.floor(m.v0 / span)); y1 = Math.ceil(Math.min(e.docHeight, m.v1) / span);
         if ((x1 - x0) * (y1 - y0) <= capacity || e.level === 0) break;
         e.level--;
@@ -211,7 +241,7 @@ export class SourcePanels {
       const source = this.sources.get(t.e.n.path);
       if (source?.status === 'loading' || !source) continue;
       missing = true;
-      if (painted && (painted >= 4 || performance.now() >= deadline)) continue;
+      if (painted && (painted >= (moving ? 1 : 4) || performance.now() >= deadline)) continue;
       if (this.cache.size >= MAX_TILES) {
         let oldest;
         for (const [key, tile] of this.cache) {
@@ -232,10 +262,10 @@ export class SourcePanels {
     canvas.width = canvas.height = 256;
     const ctx = canvas.getContext('2d', { alpha: false });
     ctx.fillStyle = '#11141d'; ctx.fillRect(0, 0, 256, 256);
-    ctx.scale(256 / WIDTH, 256 / e.docHeight);
-    ctx.font = '13px ui-monospace, Menlo, monospace'; ctx.textBaseline = 'top';
-    for (let i = 0; i < Math.min(lines.length, Math.ceil(e.docHeight / LINE), 1024); i++) {
-      ctx.fillStyle = color(lines[i]); ctx.fillText(lines[i].slice(0, 110), 6, i * LINE + 2);
+    ctx.scale(256 / e.docWidth, 256 / e.docHeight);
+    ctx.font = `${SOURCE_FONT}px ui-monospace, Menlo, monospace`; ctx.textBaseline = 'top';
+    for (let i = 0; i < lines.length; i += Math.max(1, Math.floor(lines.length / 256))) {
+      ctx.fillStyle = color(lines[i]); ctx.fillText(lines[i], PAD, i * LINE + PAD, e.docWidth - 2 * PAD);
     }
     const texture = new THREE.CanvasTexture(canvas);
     texture.colorSpace = THREE.SRGBColorSpace;
@@ -253,21 +283,21 @@ export class SourcePanels {
     const ctx = canvas.getContext('2d', { alpha: false });
     ctx.fillStyle = '#11141d'; ctx.fillRect(0, 0, SIDE, SIDE);
     ctx.setTransform(scale, 0, 0, scale, GUTTER - x * TILE, GUTTER - y * TILE);
-    ctx.font = '13px ui-monospace, Menlo, monospace';
+    ctx.font = `${SOURCE_FONT}px ui-monospace, Menlo, monospace`;
     ctx.textBaseline = 'top';
-    const first = Math.max(0, Math.floor((y * span - GUTTER / scale - 2) / LINE));
-    const last = Math.min(lines.length, Math.ceil(((y + 1) * span + GUTTER / scale) / LINE));
+    const first = Math.max(0, Math.floor((y * span - GUTTER / scale - PAD) / LINE));
+    const last = Math.min(lines.length, Math.ceil(((y + 1) * span + GUTTER / scale - PAD) / LINE));
     for (let i = first; i < last; i++) {
       ctx.fillStyle = color(lines[i]);
-      ctx.fillText(lines[i].slice(0, 110), 6, i * LINE + 2);
+      ctx.fillText(lines[i], PAD, i * LINE + PAD, e.docWidth - 2 * PAD);
     }
     const texture = new THREE.CanvasTexture(canvas);
     texture.colorSpace = THREE.SRGBColorSpace;
     texture.anisotropy = Math.min(4, this.renderer.capabilities.getMaxAnisotropy());
-    const w = Math.min(span, WIDTH - x * span), h = Math.min(span, e.docHeight - y * span);
-    const units = e.width / WIDTH;
+    const w = Math.min(span, e.docWidth - x * span), h = Math.min(span, e.docHeight - y * span);
+    const units = e.width / e.docWidth;
     const geometry = new THREE.PlaneGeometry(w * units, h * units);
-    geometry.translate((x * span + w / 2 - WIDTH / 2) * units, (e.docHeight - y * span - h / 2) * units, 0);
+    geometry.translate((x * span + w / 2 - e.docWidth / 2) * units, (e.docHeight - y * span - h / 2) * units, 0);
     const uv = geometry.attributes.uv;
     for (let i = 0; i < uv.count; i++) uv.setXY(i,
       (GUTTER + uv.getX(i) * w * scale) / SIDE,
@@ -298,12 +328,13 @@ export class SourcePanels {
   render() {
     // A separate final pass makes focus deterministic across opaque and
     // transparent scene objects; renderOrder alone cannot do that.
+    if (!this.active) return;
     this.renderer.clearDepth();
     this.renderer.render(this.overlay, this.camera);
   }
 
   get stats() {
     return { tiles: this.cache.size, maxTiles: MAX_TILES, bytes: this.cache.size * TILE_BYTES,
-      maxBytes: MAX_BYTES, paints: this.paints, pending: this.pending, inFlight: this.inFlight };
+      maxBytes: MAX_BYTES, measurements: this.measurements, paints: this.paints, pending: this.pending, inFlight: this.inFlight };
   }
 }
