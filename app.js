@@ -9,7 +9,6 @@ const LANG_COLOR = {
   rust: 0xf74c00, deka: 0x2dd4bf, js: 0xe8d44d, ts: 0x4f9cf5,
   toml: 0x9aa7b8, json: 0x9aa7b8, md: 0xb8a9e8, yaml: 0x6fbf73, other: 0x5a6a85,
 };
-const KIND_COLOR = { fn: 0x2dd4bf, struct: 0xf74c00, enum: 0xe8b93d, trait: 0xb8a9e8, impl: 0x6fbf73, const: 0x9aa7b8, static: 0x9aa7b8, type: 0x4f9cf5, mod: 0x748199, class: 0xf74c00, interface: 0x4f9cf5, let: 0x9aa7b8, var: 0x9aa7b8 };
 
 const params = new URLSearchParams(location.search);
 const canvas = document.getElementById('scene');
@@ -22,22 +21,29 @@ scene.fog = new THREE.Fog(0x0b0e14, 1400, 3200);
 
 const camera = new THREE.PerspectiveCamera(42, 1, 1, 8000);
 
-// --- camera rig: target on ground plane + distance, slight tilt ------------
+// --- camera rig: target on ground plane + distance ---------------------------
+// tilt is from vertical, and INCREASES as you zoom in: far = map view looking
+// down, close = low view so leaned-back code panels face the reader.
 const rig = {
   tx: WORLD / 2, tz: WORLD / 2, dist: 1500,
   goalTx: WORLD / 2, goalTz: WORLD / 2, goalDist: 1500,
-  min: 30, max: 2400, tilt: 0.96, // rad from vertical; ~55°
+  min: 30, max: 2400,
 };
+function tiltAt(dist) {
+  const k = Math.max(0, Math.min(1, (1000 - dist) / 970)); // 0 far → 1 at closest
+  return 0.72 + 0.38 * k * k * (3 - 2 * k); // smoothstep: 41° → ~63° from vertical
+}
 function applyCamera() {
   rig.tx += (rig.goalTx - rig.tx) * 0.16;
   rig.tz += (rig.goalTz - rig.tz) * 0.16;
   rig.dist += (rig.goalDist - rig.dist) * 0.16;
-  // google-maps style: far = horizon tilt, close = top-down so code reads
-  const t = 0.35 + (rig.dist / rig.max) * 0.61;
+  const t = tiltAt(rig.dist);
   const y = Math.cos(t) * rig.dist;
   const back = Math.sin(t) * rig.dist;
   camera.position.set(rig.tx, y, rig.tz + back);
-  camera.lookAt(rig.tx, 0, rig.tz);
+  // as panels stand up, raise the gaze from the ground to panel height
+  const gate = Math.max(0, Math.min(1, (900 - rig.dist) / 700));
+  camera.lookAt(rig.tx, 130 * gate, rig.tz);
 }
 function flyTo(tx, tz, dist) {
   rig.goalTx = tx; rig.goalTz = tz;
@@ -92,6 +98,10 @@ canvas.addEventListener('wheel', e => {
 // --- data -------------------------------------------------------------------
 const resp = await fetch('data.json');
 const data = await resp.json();
+const sourceText = new Map(); // path -> file text
+// prefetch all source up front: textures then always paint with text and the
+// create→fetch→drop→recreate churn disappears
+for (const f of data.filesTable) loadSource(f.path);
 document.getElementById('stats').textContent =
   `${data.project} · ${data.files} files · ${data.totalLines.toLocaleString()} lines · ${data.symbols.toLocaleString()} symbols`;
 
@@ -160,8 +170,9 @@ scene.add(sun);
 
 // --- source text tops (LOD textures) -----------------------------------------
 const KW = /\b(pub|fn|let|mut|impl|struct|enum|trait|mod|use|match|if|else|return|for|while|const|static|type|import|from|export|as|async|await|self|crate|effect|signal|node)\b/;
-const texCache = new Map(); // node -> {tex, mesh, lastUsed}
-const MAX_TEX = 60;
+const texCache = new Map(); // node -> {tex, mesh, wpx, lastUsed}
+const MAX_TEX = 80;
+const MAX_ANISO = renderer.capabilities.getMaxAnisotropy();
 const textGroup = new THREE.Group();
 scene.add(textGroup);
 
@@ -188,25 +199,40 @@ function loadSource(path) {
     sourceText.set(path, t);
     // repaint any texture created while text was in flight
     const node = fileNodes.find(n => n.path === path);
-    const e = node && texCache.get(node);
-    if (e) {
-      textGroup.remove(e.mesh);
-      e.mesh.material.map.dispose();
-      e.mesh.material.dispose();
-      texCache.delete(node);
-    }
+    if (node && texCache.has(node)) dropTexture(node);
   });
 }
-function ensureTexture(n) {
+function dropTexture(node) {
+  const e = texCache.get(node);
+  if (!e) return;
+  textGroup.remove(e.mesh);
+  e.mesh.material.map.dispose();
+  e.mesh.material.dispose();
+  e.mesh.geometry.dispose();
+  texCache.delete(node);
+}
+// screen-space metrics for a file rect (pass wpp = worldPerPixel() for the frame)
+function screenRect(n, wpp) {
+  return {
+    cx: (n.rect[0] + n.rect[2] / 2) * WORLD,
+    cz: (n.rect[1] + n.rect[3] / 2) * WORLD,
+    wpx: n.rect[2] * WORLD / wpp,
+    hpx: n.rect[3] * WORLD / wpp,
+  };
+}
+function ensureTexture(n, wantWpx) {
   let e = texCache.get(n);
   if (e) { e.lastUsed = frame; return e; }
   if (texCache.size >= MAX_TEX) {
     let oldest = null;
     for (const [k, v] of texCache) if (!oldest || v.lastUsed < oldest.lastUsed) oldest = { k, v };
-    if (oldest) { textGroup.remove(oldest.v.mesh); oldest.v.mesh.material.map.dispose(); oldest.v.mesh.material.dispose(); oldest.v.mesh.geometry.dispose(); texCache.delete(oldest.k); }
+    if (oldest) dropTexture(oldest.k);
   }
   const [x, y, w, h] = n.rect;
-  const wpx = 560, hpx = Math.max(64, Math.min(1024, Math.round((h / w) * wpx)));
+  // dynamic resolution: canvas ~1.35x the file's on-screen width, so text
+  // stays sharp at any zoom; re-rendered at higher res as it grows
+  const wpx = Math.max(480, Math.min(2200, Math.round(wantWpx * 1.35)));
+  const hpx = Math.max(64, Math.min(4096, Math.round((h / w) * wpx)));
   const cv = document.createElement('canvas');
   cv.width = wpx; cv.height = hpx;
   const ctx = cv.getContext('2d');
@@ -217,79 +243,83 @@ function ensureTexture(n) {
   const maxLines = Math.floor(hpx / lineH);
   for (let i = 0; i < Math.min(lines.length, maxLines); i++) {
     ctx.fillStyle = tokenColor(lines[i]);
-    ctx.fillText(lines[i].slice(0, 90), 6, i * lineH + 2);
+    ctx.fillText(lines[i].slice(0, 110), 6, i * lineH + 2);
   }
   if (lines.length > maxLines) {
     ctx.fillStyle = '#f74c00';
-    ctx.fillRect(0, hpx - 3, wpx * (maxLines / lines.length), 3);
+    ctx.fillRect(0, hpx - Math.max(3, lineH * 0.2), wpx * (maxLines / lines.length), Math.max(3, lineH * 0.2));
   }
   const tex = new THREE.CanvasTexture(cv);
   tex.colorSpace = THREE.SRGBColorSpace;
-  tex.anisotropy = 4;
+  tex.anisotropy = MAX_ANISO;
+  // panel pivots at its near edge (max z) so it can lean back toward the
+  // reader like a lectern: origin at bottom edge, extends toward -z when flat
   const geo = new THREE.PlaneGeometry(w * WORLD - 1, h * WORLD - 1);
-  const mat = new THREE.MeshBasicMaterial({ map: tex });
-  const mesh = new THREE.Mesh(geo, mat);
-  mesh.rotation.x = -Math.PI / 2;
+  geo.translate(0, (h * WORLD - 1) / 2, 0);
+  const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ map: tex }));
   const bh = boxHeight.get(n);
-  mesh.position.set((x + w / 2) * WORLD, BASE + bh + 0.15, (y + h / 2) * WORLD);
+  mesh.position.set((x + w / 2) * WORLD, BASE + bh + 0.15, (y + h) * WORLD - 1);
   textGroup.add(mesh);
-  e = { tex, mesh, lastUsed: frame };
+  e = { tex, mesh, wpx, lastUsed: frame };
   texCache.set(n, e);
   return e;
 }
+// lectern tilt: as you zoom in, panels rotate to face the camera — the lean
+// angle tracks the camera tilt (panel normal aligns with the view direction),
+// gated by distance so the far map stays flat.
+const MAX_LEAN = 1.45; // ~83°
+function panelLean() {
+  const gate = Math.max(0, Math.min(1, (900 - rig.dist) / 700));
+  return Math.min(MAX_LEAN, tiltAt(rig.dist)) * gate;
+}
+function updatePanelPoses() {
+  const lean = panelLean();
+  for (const [, e] of texCache) e.mesh.rotation.x = -Math.PI / 2 + lean;
+}
+let texBudget = 0;
+const _candCenter = new THREE.Vector3();
+const _candTarget = new THREE.Vector3();
 function updateTextTops() {
-  // give a file a source texture when its on-screen width is large enough
-  const v = new THREE.Vector3();
+  const wppT = worldPerPixel();
+  const tdist = camera.position.distanceTo(_candTarget.set(rig.tx, 0, rig.tz));
+  // collect candidates, corrected for each file's actual distance from camera
+  const cands = [];
   for (const n of fileNodes) {
-    v.set((n.rect[0] + n.rect[2] / 2) * WORLD, 0, (n.rect[1] + n.rect[3] / 2) * WORLD).project(camera);
-    const sx = (v.x * 0.5 + 0.5) * innerWidth, sy = (-v.y * 0.5 + 0.5) * innerHeight;
-    if (sx < -200 || sx > innerWidth + 200 || sy < -200 || sy > innerHeight + 200) continue;
-    const wpx = n.rect[2] * WORLD / worldPerPixel();
-    if (wpx > 190) ensureTexture(n);
+    const s = screenRect(n, wppT);
+    if (s.wpx < 200) continue;
+    _proj.set(s.cx, 0, s.cz).project(camera);
+    if (Math.abs(_proj.x) > 1.25 || Math.abs(_proj.y) > 1.25) continue;
+    const k = tdist / Math.max(1, camera.position.distanceTo(_candCenter.set(s.cx, 0, s.cz)));
+    s.wpx *= k; s.hpx *= k;
+    if (s.wpx < 200) continue;
+    cands.push([n, s]);
   }
-}
-const _wpp = new THREE.Vector3();
-function worldPerPixel() {
-  _wpp.set((data.tree.rect[2]) * WORLD, 0, 0).project(camera);
-  const ax = (_wpp.x * 0.5 + 0.5) * innerWidth;
-  _wpp.set(data.tree.rect[2] * WORLD + 10, 0, 0).project(camera);
-  return 10 / Math.abs(((_wpp.x * 0.5 + 0.5) * innerWidth) - ax);
-}
-
-// --- symbol boxes at close zoom ----------------------------------------------
-const SYM_MAX = 4096;
-const symGeo = new THREE.BoxGeometry(1, 1, 1);
-const symMesh = new THREE.InstancedMesh(symGeo, new THREE.MeshBasicMaterial(), SYM_MAX);
-symMesh.count = 0;
-scene.add(symMesh);
-function updateSymbols() {
-  const close = rig.dist < 260;
-  let count = 0;
-  if (close) {
-    const m = new THREE.Matrix4(), col = new THREE.Color();
-    for (const n of fileNodes) {
-      if (count >= SYM_MAX - 8) break;
-      if (!texCache.has(n)) continue;
-      const [x, y, w, h] = n.rect;
-      const bh = boxHeight.get(n);
-      const nSyms = n.syms.length;
-      if (!nSyms) continue;
-      const fh = h * WORLD - 2;
-      for (const s of n.syms) {
-        const y0 = (s.line / Math.max(n.lines, 1)) * fh;
-        const y1 = (Math.max(s.endLine, s.line + 1) / Math.max(n.lines, 1)) * fh;
-        const sh = Math.max(1.2, y1 - y0);
-        m.makeScale(w * WORLD - 2, 1.1, sh);
-        m.setPosition((x + w / 2) * WORLD, BASE + bh + 0.7, y * WORLD + 1 + y0 + sh / 2);
-        symMesh.setMatrixAt(count, m);
-        symMesh.setColorAt(count, col.setHex(KIND_COLOR[s.kind] ?? 0x9aa7b8));
-        count++;
-      }
+  // biggest on screen first — the focused file must never starve behind
+  // off-center stragglers that happen to sit inside the frustum wedge
+  cands.sort((a, b) => b[1].wpx - a[1].wpx);
+  for (const [n, s] of cands) {
+    const e = texCache.get(n);
+    if (!e) {
+      if (texBudget > 0) { texBudget--; ensureTexture(n, s.wpx); }
+    } else if (s.wpx > e.wpx * 1.5 && texBudget > 0) {
+      // screen outgrew the texture: repaint sharper
+      texBudget--;
+      dropTexture(n);
+      ensureTexture(n, s.wpx);
     }
   }
-  symMesh.count = count;
-  symMesh.instanceMatrix.needsUpdate = true;
-  if (symMesh.instanceColor) symMesh.instanceColor.needsUpdate = true;
+}
+const _proj = new THREE.Vector3();
+const _wpp = new THREE.Vector3();
+// world-units-per-screen-pixel AT THE CAMERA TARGET — must be measured at the
+// lookAt point, not a far corner of the plane: at close zoom the grazing
+// angle makes the far corner ~3x farther, which starves the LOD thresholds.
+function worldPerPixel() {
+  _wpp.set(rig.tx + 5, 0, rig.tz).project(camera);
+  const ax = (_wpp.x * 0.5 + 0.5) * innerWidth;
+  _wpp.set(rig.tx - 5, 0, rig.tz).project(camera);
+  const bx = (_wpp.x * 0.5 + 0.5) * innerWidth;
+  return 10 / Math.max(1e-6, Math.abs(ax - bx));
 }
 
 // --- labels (HTML overlay) ----------------------------------------------------
@@ -344,7 +374,7 @@ hl.visible = false;
 scene.add(hl);
 function focusFile(n) {
   const [x, y, w, h] = n.rect;
-  flyTo((x + w / 2) * WORLD, (y + h / 2) * WORLD, Math.max(60, Math.max(w, h) * WORLD * 1.5));
+  flyTo((x + w / 2) * WORLD, (y + h / 2) * WORLD, Math.max(110, Math.max(w, h) * WORLD * 1.9));
   const bh = boxHeight.get(n);
   hl.scale.set(w * WORLD + 2, bh + 4, h * WORLD + 2);
   hl.position.set((x + w / 2) * WORLD, BASE + (bh + 2) / 2, (y + h / 2) * WORLD);
@@ -352,7 +382,6 @@ function focusFile(n) {
 }
 
 // --- search ----------------------------------------------------------------------
-const sourceText = new Map();
 const qEl = document.getElementById('q');
 const resEl = document.getElementById('results');
 let results = [], selIdx = -1;
@@ -425,12 +454,12 @@ addEventListener('resize', resize);
 resize();
 
 let frame = 0;
-let lodTick = 0;
 function loop() {
   frame++;
+  texBudget = dragging ? 2 : 4; // fewer canvas paints mid-drag
   applyCamera();
-  if (frame % 6 === 0) updateTextTops();
-  if (frame % 6 === 3) updateSymbols();
+  if (frame % 4 === 0) updateTextTops();
+  updatePanelPoses();
   if (frame % 3 === 1) updateLabels();
   renderer.render(scene, camera);
   requestAnimationFrame(loop);
