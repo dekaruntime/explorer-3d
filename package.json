@@ -5,7 +5,8 @@
   "scripts": {
     "gen": "node tools/gen-demo.mjs",
     "index": "node tools/index.mjs",
-    "verify": "node tools/verify.mjs"
+    "verify": "node tools/verify.mjs",
+    "test": "node tools/test-rendering.mjs"
   },
   "keywords": [],
   "author": "",
