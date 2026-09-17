@@ -5,8 +5,11 @@
   "scripts": {
     "gen": "node tools/gen-demo.mjs",
     "index": "node tools/index.mjs",
+    "build": "node tools/gen-demo.mjs && node tools/build.mjs",
     "verify": "node tools/verify.mjs",
-    "test": "node tools/test-rendering.mjs"
+    "test": "node tools/test.mjs",
+    "test:layout": "node tools/test-layout.mjs",
+    "test:focus": "node tools/test-focus.mjs"
   },
   "keywords": [],
   "author": "",

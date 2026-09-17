@@ -3,3 +3,4 @@ tools/shots/
 demo-src/
 .tmp/
 .worktrees/
+dist/

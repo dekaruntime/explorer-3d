@@ -8,12 +8,13 @@ export const root = fileURLToPath(new URL('..', import.meta.url));
 export async function startBrowser() {
   const executablePath = process.argv.find(a => a.startsWith('--browser='))?.slice(10);
   const appOverride = process.argv.find(a => a.startsWith('--app='))?.slice(6);
+  const fixtureRoot = resolve(process.argv.find(a => a.startsWith('--fixture='))?.slice(10) || root);
   const server = createServer((req, res) => {
     const pathname = new URL(req.url, 'http://localhost').pathname;
     if (pathname === '/favicon.ico') { res.writeHead(204); res.end(); return; }
     try {
-      let path = resolve(root, '.' + decodeURIComponent(pathname));
-      if (!path.startsWith(resolve(root) + sep)) throw new Error('outside fixture');
+      let path = resolve(fixtureRoot, '.' + decodeURIComponent(pathname));
+      if (!path.startsWith(fixtureRoot + sep)) throw new Error('outside fixture');
       if (pathname === '/app.js' && appOverride) path = resolve(root, appOverride);
       if (!statSync(path).isFile()) throw new Error('not a file');
       const mime = { '.html': 'text/html', '.js': 'text/javascript', '.json': 'application/json' };
@@ -30,12 +31,15 @@ export async function startBrowser() {
 }
 
 export async function settle(page) {
+  // Viewport changes and wheel input can be delivered after the automation
+  // command resolves. Let those browser events reach the render loop first.
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
   await page.waitForFunction(() => {
     const d = window.__dbg;
     if (!window.__ready) return false;
     if (!d.sourcePanels) return d.texCache.size > 0;
     const s = d.sourcePanels.stats, r = d.rig;
-    return s.paints > 0 && !s.pending && s.inFlight === 0 &&
+    return d.draws > 0 && !d.needsFrame && !d.cameraMoving && !s.pending && s.inFlight === 0 &&
       Math.abs(r.goalTx - r.tx) + Math.abs(r.goalTz - r.tz) + Math.abs(r.goalDist - r.dist) <= .001;
   }, null, { timeout: 60000 });
 }
