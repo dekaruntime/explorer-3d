@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>deka explorer — poc</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; overflow: hidden; background: #0b0e14; color: #d6deeb;
+    font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #scene { position: fixed; inset: 0; }
+  #labels { position: fixed; inset: 0; pointer-events: none; overflow: hidden; }
+  .lbl { position: absolute; transform: translate(-50%, -100%); white-space: nowrap;
+    color: #aab6c8; text-shadow: 0 1px 3px #000; font-size: 12px; pointer-events: none; }
+  .lbl.dir { color: #7ee0d2; font-weight: 600; }
+  #hud { position: fixed; top: 0; left: 0; right: 0; display: flex; gap: 12px; align-items: center;
+    padding: 10px 14px; background: linear-gradient(#0b0e14f2, #0b0e1400); z-index: 5; }
+  #hud .title { font-weight: 700; color: #f74c00; letter-spacing: .5px; }
+  #hud .title span { color: #7ee0d2; }
+  #stats { color: #748199; font-size: 12px; }
+  #search { margin-left: auto; position: relative; width: min(420px, 44vw); }
+  #search input { width: 100%; padding: 8px 12px; border-radius: 8px; border: 1px solid #26314a;
+    background: #111726; color: #d6deeb; outline: none; font: inherit; }
+  #search input:focus { border-color: #f74c00; }
+  #results { position: absolute; top: calc(100% + 6px); right: 0; width: 100%; max-height: 50vh;
+    overflow-y: auto; background: #101524ee; border: 1px solid #26314a; border-radius: 8px;
+    display: none; z-index: 10; }
+  #results.open { display: block; }
+  .res { padding: 7px 12px; cursor: pointer; display: flex; gap: 8px; align-items: baseline; }
+  .res:hover, .res.sel { background: #1b2438; }
+  .res .kind { color: #f74c00; font-size: 11px; width: 44px; flex: none; }
+  .res .path { color: #748199; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .res .refs { margin-left: auto; color: #55617a; font-size: 11px; flex: none; }
+  #hint { position: fixed; bottom: 10px; left: 14px; color: #55617a; font-size: 12px; z-index: 5; }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div id="labels"></div>
+<div id="hud">
+  <div class="title">deka<span>explorer</span></div>
+  <div id="stats"></div>
+  <div id="search">
+    <input id="q" type="text" placeholder="search symbols / files…  ( / )" autocomplete="off" spellcheck="false">
+    <div id="results"></div>
+  </div>
+</div>
+<div id="hint">drag to pan · scroll to zoom · click a building to focus · / to search</div>
+<script type="importmap">{ "imports": { "three": "./vendor/three.module.js" } }</script>
+<script type="module" src="./app.js"></script>
+</body>
+</html>

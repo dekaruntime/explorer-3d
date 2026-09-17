@@ -1,0 +1,19 @@
+{
+  "name": "explorer",
+  "version": "0.1.0",
+  "description": "deka explorer — google-maps-style 3D codebase visualizer (POC)",
+  "scripts": {
+    "gen": "node tools/gen-demo.mjs",
+    "index": "node tools/index.mjs",
+    "verify": "node tools/verify.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "Apache-2.0",
+  "type": "module",
+  "dependencies": {
+    "playwright": "^1.48.0",
+    "three": "^0.170.0"
+  },
+  "private": true
+}
